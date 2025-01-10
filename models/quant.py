@@ -36,7 +36,7 @@ class VectorQuantizer2(nn.Module):
         self.record_hit = 0
         
         self.beta: float = beta
-        self.embedding = nn.Embedding(self.vocab_size, self.Cvae)
+        self.embedding = nn.Embedding(self.vocab_size, self.Cvae) # codebook/lookup table. Output: Each row of the embedding matrix represents a codebook embedding.
         
         # only used for progressive training of VAR (not supported yet, will be tested and supported in the future)
         self.prog_si = -1   # progressive training: not supported yet, prog_si always -1
@@ -55,7 +55,7 @@ class VectorQuantizer2(nn.Module):
         B, C, H, W = f_BChw.shape
         f_no_grad = f_BChw.detach()
         
-        f_rest = f_no_grad.clone()
+        f_rest = f_no_grad.clone() # f_rest is the residual feature map, which starts as the full feature map f produced by the encoder.
         f_hat = torch.zeros_like(f_rest)
         
         with torch.cuda.amp.autocast(enabled=False):
@@ -64,36 +64,45 @@ class VectorQuantizer2(nn.Module):
             SN = len(self.v_patch_nums)
             for si, pn in enumerate(self.v_patch_nums): # from small to large
                 # find the nearest embedding
-                if self.using_znorm:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
-                    rest_NC = F.normalize(rest_NC, dim=-1)
-                    idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1)
-                else:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
-                    d_no_grad = torch.sum(rest_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)
-                    d_no_grad.addmm_(rest_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
-                    idx_N = torch.argmin(d_no_grad, dim=1)
+                if self.using_znorm: # using_znorm=True (cosine similarity)
+                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C) # (B, h, w, C) -> (B*h*w, C)
+                    rest_NC = F.normalize(rest_NC, dim=-1) # Normalizes the feature map points rest_NC along the embedding dimension C (L2 norm).
+                    # Normalizes the codebook embeddings along each row, dot product with normalized rest_NC which gives cosine similarity scores.
+                    # Finds the index of the embedding k with the highest cosine similarity for each feature point.
+                    idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1) # (B*h*w, C) @ (C, vocab_size) -> (B*h*w, vocab_size) -> argmax -> (B*h*w)
+                else: # using_znorm=False (Euclidean distance).
+                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C) # (B, h, w, C) -> (B*h*w, C)
+                    # ||x - e_k||^2 = ||x||^2 + ||e_k||^2 - 2 * x * e_k
+                    # ||x||^2 -> (B*h*w, C) ==> ||x||^2 = sum(x^2, dim=1, keepdim=True) -> (B*h*w, 1) 
+                    # ||e_k||^2 -> (vocab_size, C) ==> ||e_k||^2 = sum(e_k^2, dim=1, keepdim=False) -> (vocab_size,)
+                    d_no_grad = torch.sum(rest_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False) # (B*h*w, 1) + (vocab_size,) -> (B*h*w, vocab_size)
+                    # -2 * x * e_k = -2 * x @ e_k^T. addmm_ is in-place operation, input = beta * input + alpha * mat1 @ mat2
+                    d_no_grad.addmm_(rest_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, C) @ (C, vocab_size) -> (B*h*w, vocab_size), addmm_ is in-place operation
+                    idx_N = torch.argmin(d_no_grad, dim=1) # (B*h*w)
                 
-                hit_V = idx_N.bincount(minlength=self.vocab_size).float()
+                hit_V = idx_N.bincount(minlength=self.vocab_size).float() # count the number of occurrences of each value in the tensor idx_N
                 if self.training:
                     if dist.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
                 
                 # calc loss
-                idx_Bhw = idx_N.view(B, pn, pn)
+                idx_Bhw = idx_N.view(B, pn, pn) # (B*h*w) -> (B, h, w)
+                # h_BChw: quantized lookup embedding. interpolate/upscale the embeddings (h,w) to the same full size (H, W) as the feature map, then permute the tensor to (B, C, H, W), 
                 h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
-                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
-                f_hat = f_hat + h_BChw
-                f_rest -= h_BChw
-                
+                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)  # A refinement step is applied to the quantized embeddings h_BChw for the current scale.
+                                                             # The refinement step is a convolutional layer with kernel size 3x3 and stride 1.
+                f_hat = f_hat + h_BChw # Accumulates the reconstructed feature map from quantized embeddings, approximate feature map f_BChw. shape (B, C, H, W)
+                f_rest -= h_BChw # Updates the residual f_rest by removing the contribution of the current scale's embeddings h_BChw.
+                                 # passes the remaining unexplained features to the next finer scale.
                 if self.training and dist.initialized():
-                    handler.wait()
-                    if self.record_hit == 0: self.ema_vocab_hit_SV[si].copy_(hit_V)
-                    elif self.record_hit < 100: self.ema_vocab_hit_SV[si].mul_(0.9).add_(hit_V.mul(0.1))
-                    else: self.ema_vocab_hit_SV[si].mul_(0.99).add_(hit_V.mul(0.01))
+                    handler.wait() # The codebook vectors are updated via EMA, which aligns them with the latent space without relying on gradient updates.
+                    if self.record_hit == 0: self.ema_vocab_hit_SV[si].copy_(hit_V) # Exponential Moving Average (EMA). hit_V histogram of embeddings
+                    elif self.record_hit < 100: self.ema_vocab_hit_SV[si].mul_(0.9).add_(hit_V.mul(0.1)) # EMA = 0.9 * EMA + 0.1 * hit_V
+                    else: self.ema_vocab_hit_SV[si].mul_(0.99).add_(hit_V.mul(0.01)) # EMA = 0.99 * EMA + 0.01 * hit_V
                     self.record_hit += 1
                 vocab_hit_V.add_(hit_V)
                 mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)
-            
+                # Commitment loss: make sure encoder output f_BChw  ze(x)  commits to the quantized embeddings (f_hat.data) (.data detach from graph), sg[e]. 
+                # Dictionary Loss: ensures the quantized embeddings f_hat accurately reconstruct the encoder output feature map f_no_grad
             mean_vq_loss *= 1. / SN
             f_hat = (f_hat.data - f_no_grad).add_(f_BChw)
         
@@ -126,7 +135,7 @@ class VectorQuantizer2(nn.Module):
             for si, pn in enumerate(self.v_patch_nums): # from small to large
                 f_hat = F.interpolate(f_hat, size=(pn, pn), mode='bicubic')
                 h_BChw = self.quant_resi[si/(SN-1)](ms_h_BChw[si])
-                f_hat.add_(h_BChw)
+                f_hat.add_(h_BChw) # The refined embeddings are added to the feature map f_hat.
                 if last_one: ls_f_hat_BChw = f_hat
                 else: ls_f_hat_BChw.append(f_hat)
         
@@ -178,8 +187,8 @@ class VectorQuantizer2(nn.Module):
         for si in range(SN-1):
             if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # progressive training: not supported yet, prog_si always -1
             h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_next, pn_next), size=(H, W), mode='bicubic')
-            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
-            pn_next = self.v_patch_nums[si+1]
+            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw)) # upscale the embeddings to the full size (H, W) of the feature map, run through conv layers
+            pn_next = self.v_patch_nums[si+1] # Update pn_next to the next scale’s resolution.
             next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
     
@@ -202,7 +211,7 @@ class Phi(nn.Conv2d):
         super().__init__(in_channels=embed_dim, out_channels=embed_dim, kernel_size=ks, stride=1, padding=ks//2)
         self.resi_ratio = abs(quant_resi)
     
-    def forward(self, h_BChw):
+    def forward(self, h_BChw): # h_BChw * (1 - resi_ratio) + Conv2d(h_BChw) * resi_ratio
         return h_BChw.mul(1-self.resi_ratio) + super().forward(h_BChw).mul_(self.resi_ratio)
 
 
@@ -233,8 +242,8 @@ class PhiNonShared(nn.ModuleList):
     def __init__(self, qresi: List):
         super().__init__(qresi)
         # self.qresi = qresi
-        K = len(qresi)
-        self.ticks = np.linspace(1/3/K, 1-1/3/K, K) if K == 4 else np.linspace(1/2/K, 1-1/2/K, K)
+        K = len(qresi) # Defines evenly spaced tick marks across the range [0, 1], used to index the available Phi instances (qresi_ls).
+        self.ticks = np.linspace(1/3/K, 1-1/3/K, K) if K == 4 else np.linspace(1/2/K, 1-1/2/K, K) # [0.08333333, 0.36111111, 0.63888889, 0.91666667] if
     
     def __getitem__(self, at_from_0_to_1: float) -> Phi:
         return super().__getitem__(np.argmin(np.abs(self.ticks - at_from_0_to_1)).item())

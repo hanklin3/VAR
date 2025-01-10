@@ -33,34 +33,34 @@ class Args(Tap):
     depth: int = 16     # VAR depth
     # VAR initialization
     ini: float = -1     # -1: automated model parameter initialization
-    hd: float = 0.02    # head.w *= hd
-    aln: float = 0.5    # the multiplier of ada_lin.w's initialization
+    hd: float = 0.02    # head.w *= hd # Multiplier for head weights.
+    aln: float = 0.5    # the multiplier of ada_lin.w's initialization # Multipliers for adaptive linear weights
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     # VAR optimization
     fp16: int = 0           # 1: using fp16, 2: bf16
     tblr: float = 1e-4      # base lr
     tlr: float = None       # lr = base lr * (bs / 256)
-    twd: float = 0.05       # initial wd
+    twd: float = 0.05       # initial wd # Initial weight decay.
     twde: float = 0         # final wd, =twde or twd
-    tclip: float = 2.       # <=0 for not using grad clip
+    tclip: float = 2.       # <=0 for not using grad clip # Gradient clipping threshold. Values <= 0 disable clipping.
     ls: float = 0.0         # label smooth
     
     bs: int = 768           # global batch size
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
-    ac: int = 1             # gradient accumulation
+    ac: int = 1             # gradient accumulation # Gradient accumulation steps.
     
     ep: int = 250
-    wp: float = 0
+    wp: float = 0               #  Number of epochs for learning rate warmup.
     wp0: float = 0.005      # initial lr ratio at the begging of lr warm up
     wpe: float = 0.01       # final lr ratio at the end of training
-    sche: str = 'lin0'      # lr schedule
+    sche: str = 'lin0'      # lr schedule # (e.g., 'lin0' for linear).
     
     opt: str = 'adamw'      # lion: https://cloud.tencent.com/developer/article/2336657?areaId=106001 lr=5e-5 (0.25x) wd=0.8 (8x); Lion needs a large bs to work
     afuse: bool = True      # fused adamw
     
     # other hps
-    saln: bool = False      # whether to use shared adaln
+    saln: bool = False      # whether to use shared adaln  # Whether to use shared Adaptive Layer Normalization.
     anorm: bool = True      # whether to use L2 normalized attention
     fuse: bool = True       # whether to use fused op like flash attn, xformers, fused MLP, fused LayerNorm, etc.
     
@@ -221,7 +221,7 @@ def init_dist_and_get_args():
         args.pg0 = 1
     else:
         if args.data_path == '/path/to/imagenet':
-            raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}')
+            raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}, found {args.data_path}')
     
     # warn args.extra_args
     if len(args.extra_args) > 0:

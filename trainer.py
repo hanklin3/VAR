@@ -40,7 +40,7 @@ class VARTrainer(object):
         self.last_l = patch_nums[-1] * patch_nums[-1]
         self.loss_weight = torch.ones(1, self.L, device=device) / self.L
         
-        self.patch_nums, self.resos = patch_nums, resos
+        self.patch_nums, self.resos = patch_nums, resos # resos (pn * args.patch_size=16). Store the patch numbers and resolutions for each scale.
         self.begin_ends = []
         cur = 0
         for i, pn in enumerate(patch_nums):
@@ -102,14 +102,14 @@ class VARTrainer(object):
         B, V = label_B.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
         
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
-        gt_BL = torch.cat(gt_idx_Bl, dim=1)
-        x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
-        
+        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW) # List[B, patch_h*patch_w]
+        gt_BL = torch.cat(gt_idx_Bl, dim=1) # (B, L), ground truth quantized indices for the input image batch
+        x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl) # (B, L, Cv), quantized indices to var input
+        # teacher forcing input, "wo" means without, and "first_l" refers to the first token in the sequence, Used to predict the next token during training.
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
-            logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
+            logits_BLV = self.var(label_B, x_BLCv_wo_first_l) # (B, L, V), logits for the input image batch, V is the vocab size
+            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1) # (B, L). logits shape is (B, L, V), gt shape is (B, L)
             if prog_si >= 0:    # in progressive training
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
