@@ -52,13 +52,13 @@ class VAR(nn.Module):
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
-        self.word_embed = nn.Linear(self.Cvae, self.C)
+        self.word_embed = nn.Linear(self.Cvae, self.C) # Embed VQVAE tokens
         
         # 2. class embedding
         init_std = math.sqrt(1 / self.C / 3)
         self.num_classes = num_classes
         self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
-        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
+        self.class_emb = nn.Embedding(self.num_classes + 1, self.C) # Class embedding
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
@@ -71,7 +71,7 @@ class VAR(nn.Module):
             pos_1LC.append(pe)
         pos_1LC = torch.cat(pos_1LC, dim=1)     # 1, L, C
         assert tuple(pos_1LC.shape) == (1, self.L, self.C)
-        self.pos_1LC = nn.Parameter(pos_1LC)
+        self.pos_1LC = nn.Parameter(pos_1LC) # Position embedding
         # level embedding (similar to GPT's segment embedding, used to distinguish different levels of token pyramid)
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
@@ -82,7 +82,7 @@ class VAR(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
-        self.blocks = nn.ModuleList([
+        self.blocks = nn.ModuleList([ # Transformer blocks
             AdaLNSelfAttn(
                 cond_dim=self.D, shared_aln=shared_aln,
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -104,13 +104,55 @@ class VAR(nn.Module):
         
         # 5. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
-        dT = d.transpose(1, 2)    # dT: 11L
-        lvl_1L = dT[:, 0].contiguous()
+        """
+        # 1. Create d tensor:
+        # For patch_nums=(1,2,3):
+        # Scale 0 (1x1): 1 token    -> index 0
+        # Scale 1 (2x2): 4 tokens   -> index 1
+        # Scale 2 (3x3): 9 tokens   -> index 2
+        d = [[0, 1,1,1,1, 2,2,2,2,2,2,2,2,2]]  # 1 + 4 + 9 = 14 tokens total
+        dT = [[0],
+            [1],
+            [1],
+            [1],
+            [1],
+            [2],
+            [2],
+            [2],
+            [2],
+            [2],
+            [2],
+            [2],
+            [2],
+            [2]]
+
+        # Result of torch.where(d >= dT, 0., -inf):
+        [[ 0  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞]  # Scale 0 token: can only attend to itself
+        [ 0   0   0   0   0  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞]  # Scale 1 tokens: can attend to scale 0,1
+        [ 0   0   0   0   0  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞]  # Scale 1
+        [ 0   0   0   0   0  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞]  # Scale 1
+        [ 0   0   0   0   0  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞  -∞]  # Scale 1
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2 tokens: can attend to all scales
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]  # Scale 2
+        [ 0   0   0   0   0   0   0   0   0   0   0   0   0   0]] # Scale 2
+        - Each row represents a token that's doing the attending (source)
+        - Each column represents a token that can be attended to (target)
+        """
+        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1) # (1, L, 1)
+        # Example with patch_nums=[1,2]: d = [[0,1,1,1,1]] where 0 is scale 0 (1x1) and 1 is scale 1 (2x2)
+        dT = d.transpose(1, 2)    # dT: 1 x 1 x L
+        lvl_1L = dT[:, 0].contiguous() # 1 x L
         self.register_buffer('lvl_1L', lvl_1L)
         attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
-        
+        # Register the bias as a buffer (persistent state) for the module, so it's reused during training but doesn't require gradients.
+
         # 6. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
@@ -154,31 +196,62 @@ class VAR(nn.Module):
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]) # Get class embedding as start token
         
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
+            """
+            # Process each scale sequentially
+            cur = 0  # Current position in sequence
+            for i, pn in enumerate(self.patch_nums):
+                l = pn * pn  # Number of tokens at this scale
+                # Fill logits for current scale's positions
+                logits_BLV[:, cur:cur+l] = ...  # Process tokens for this scale
+                cur += l  # Move to next scale's starting position
+
+            Scale 0 (1x1):                → 1 token
+
+            Scale 1 (2x2):               → 4 tokens
+
+            Scale 2 (3x3):               → 9 tokens
+
+            Sequence: [0|1 1 1 1|2 2 2 2 2 2 2 2 2]  → 14 tokens total
+                       ↑ ↑       ↑
+                  Scale0 Scale1  Scale2     
+            """
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             cur_L += pn*pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD) # [B, 6*C] # Output from shared_ada_lin. if using shared_aln: [B, 1, 6, C] # Reshaped adaptive layer norm parameters
             x = next_token_map
             AdaLNSelfAttn.forward
-            for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            for b in self.blocks: # 1. Use transformer to predict next tokens
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)  # x: [B, L, C], L is total sequence length (1^2 + 2^2 + 3^2 = 14)
+                # attn_bias: [1, 1, L, L] # Attention mask (None during inference)
+                # # or when expanded for multiple heads:
+                # attn_bias: [B*num_heads, L, L]
+
             logits_BlV = self.get_logits(x, cond_BD)
-            
+            # 2. Apply classifier-free guidance
             t = cfg * ratio
             logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+
+            # 3. Sample next tokens. Sample from these logits (rather than taking the argmax) for a few key reasons: 
+            # Quality (staying close to the most likely tokens), Diversity (allowing some randomness)
+            idx_Bl = sample_with_top_k_top_p_(logits_BlV,     
+                rng=rng,      # Random generator for sampling
+                top_k=top_k,  # Only sample from the k most likely tokens
+                top_p=top_p,  # (nucleus sampling): Only sample from tokens that comprise the top p% of probability mass
+                num_samples=1)[:, :, 0]
             if not more_smooth: # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
+            # 4. Get embeddings and prepare for next scale
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
             if si != self.num_stages_minus_1:   # prepare for next stage
@@ -191,6 +264,11 @@ class VAR(nn.Module):
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
+        During Training process:
+        1. Get ground truth tokens from VQVAE encoder (Algorithm 1)
+        2. Feed tokens to transformer autoregressively
+        3. Train to predict next token in sequence
+
         :param label_B: label_B
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
         :return: logits BLV, V is vocab_size
@@ -199,11 +277,11 @@ class VAR(nn.Module):
         B = x_BLCv_wo_first_l.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
             label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-            sos = cond_BD = self.class_emb(label_B)
+            sos = cond_BD = self.class_emb(label_B) # Get class embedding as start token
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
             
             if self.prog_si == 0: x_BLC = sos
-            else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1) # class Combine with position embeddings
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
         
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
@@ -218,9 +296,9 @@ class VAR(nn.Module):
         attn_bias = attn_bias.to(dtype=main_type)
         
         AdaLNSelfAttn.forward
-        for i, b in enumerate(self.blocks):
+        for i, b in enumerate(self.blocks): # Pass through transformer blocks
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD) # Predict next token logits
         
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):

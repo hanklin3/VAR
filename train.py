@@ -192,11 +192,11 @@ def main_training():
                 # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
-        
+        ############################## train_one_ep
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
         )
-        
+        ############################# stats
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
         if L_tail != -1: best_L_tail, best_acc_tail = min(best_L_tail, L_tail), max(best_acc_tail, acc_tail)
@@ -205,8 +205,8 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
-        if is_val_and_also_saving:
+        is_val_and_also_saving = (ep + 1) % 1 == 0 or (ep + 1) == args.ep
+        if is_val_and_also_saving: # This uses Algorithm 2 internally to reconstruct images
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
@@ -295,10 +295,12 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         
         stepping = (g_it + 1) % args.ac == 0
         step_cnt += int(stepping)
-        
+        # 1. Get tokens using Algorithm 1 (VQVAE encoding),  This happens inside trainer.train_step:
         grad_norm, scale_log2 = trainer.train_step(
             it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, label_B=label, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
+            inp_B3HW=inp,  # Input image
+            label_B=label, # Class label
+            prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
         
         me.update(tlr=max_tlr)

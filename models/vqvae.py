@@ -54,6 +54,10 @@ class VQVAE(nn.Module):
     
     # ===================== `forward` is only used in VAE training =====================
     def forward(self, inp, ret_usages=False):   # -> rec_B3HW, idx_N, loss
+        # Algorithm 1: Multi-scale VQVAE Encoding
+        # 1. Encode image: f = E(im)
+        # 2. self.quantize: Get tokens and embeddings at multiple scales
+        # 3. Decode back to reconstructed image
         VectorQuantizer2.forward
         f_hat, usages, vq_loss = self.quantize(self.quant_conv(self.encoder(inp)), ret_usages=ret_usages)
         return self.decoder(self.post_quant_conv(f_hat)), usages, vq_loss
@@ -67,16 +71,36 @@ class VQVAE(nn.Module):
         return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums)
     
     def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], same_shape: bool, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
+        """
+        Algorithm 2: Multi-scale VQVAE Reconstruction
+        Inputs: multi-scale token maps R (ms_idx_Bl)
+        Hyperparameters: steps K, resolutions (h_k, w_k)
+
+        This reconstruction is deterministic (tokens → image), Already have all tokens, just reconstruct. 
+        In generation autoregressive_infer_cfg is probabilistic (predict tokens → image), no tokens, just given class label.
+        """
+        # Initialize reconstruction
         B = ms_idx_Bl[0].shape[0]
         ms_h_BChw = []
-        for idx_Bl in ms_idx_Bl:
+        # For k = 1,...,K do
+        for idx_Bl in ms_idx_Bl: # Each idx_Bl represents r_k = queue_pop(R)
             l = idx_Bl.shape[1]
             pn = round(l ** 0.5)
+            # Step 6: z_k = lookup(Z, r_k) - get embeddings from codebook
             ms_h_BChw.append(self.quantize.embedding(idx_Bl).transpose(1, 2).view(B, self.Cvae, pn, pn))
+       
         return self.embed_to_img(ms_h_BChw=ms_h_BChw, all_to_max_scale=same_shape, last_one=last_one)
     
     def embed_to_img(self, ms_h_BChw: List[torch.Tensor], all_to_max_scale: bool, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
+        """
+        Complete steps 7-9 of Algorithm 2:
+        - Interpolate embeddings
+        - Accumulate reconstructions
+        - Decode final image
+        """
         if last_one:
+            # Steps 7-8: Interpolate and accumulate f̂ = f̂ + φ_k(z_k), embed_to_fhat()
+            # Step 9: îm = D(f̂) - decode to reconstructed image
             return self.decoder(self.post_quant_conv(self.quantize.embed_to_fhat(ms_h_BChw, all_to_max_scale=all_to_max_scale, last_one=True))).clamp_(-1, 1)
         else:
             return [self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1) for f_hat in self.quantize.embed_to_fhat(ms_h_BChw, all_to_max_scale=all_to_max_scale, last_one=False)]

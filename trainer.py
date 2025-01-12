@@ -99,22 +99,27 @@ class VARTrainer(object):
         if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
         
         # forward
+        #Train step 2: VAR Training (after VQVAE is trained):
+        # VQVAE is frozen
+        # Use Algorithm 1 to get ground truth tokens
+        # Train transformer to predict these tokens
+        # Uses teacher forcing (showing ground truth tokens during training)
         B, V = label_B.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
-        
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW) # List[B, patch_h*patch_w]
+        # 1. Get ground truth tokens using Algorithm 1
+        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW) # List[B, patch_h*patch_w] codebook indices, multi-scale tokens R
         gt_BL = torch.cat(gt_idx_Bl, dim=1) # (B, L), ground truth quantized indices for the input image batch
         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl) # (B, L, Cv), quantized indices to var input
         # teacher forcing input, "wo" means without, and "first_l" refers to the first token in the sequence, Used to predict the next token during training.
         with self.var_opt.amp_ctx:
-            self.var_wo_ddp.forward
+            self.var_wo_ddp.forward # 2. Train transformer to predict tokens
             logits_BLV = self.var(label_B, x_BLCv_wo_first_l) # (B, L, V), logits for the input image batch, V is the vocab size
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1) # (B, L). logits shape is (B, L, V), gt shape is (B, L)
-            if prog_si >= 0:    # in progressive training
+            if prog_si >= 0:    # in progressive training - start with coarse scales
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
                 lw = self.loss_weight[:, :ed].clone()
-                lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
+                lw[:, bg:ed] *= min(max(prog_wp, 0), 1)  # Gradually increase weight for finer scales
             else:               # not in progressive training
                 lw = self.loss_weight
             loss = loss.mul(lw).sum(dim=-1).mean()

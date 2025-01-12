@@ -144,10 +144,10 @@ class VectorQuantizer2(nn.Module):
     def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
         B, C, H, W = f_BChw.shape
         f_no_grad = f_BChw.detach()
-        f_rest = f_no_grad.clone()
+        f_rest = f_no_grad.clone() # Initialize residual feature map
         f_hat = torch.zeros_like(f_rest)
         
-        f_hat_or_idx_Bl: List[torch.Tensor] = []
+        f_hat_or_idx_Bl: List[torch.Tensor] = []  # Store tokens R for each scale
         
         patch_hws = [(pn, pn) if isinstance(pn, int) else (pn[0], pn[1]) for pn in (v_patch_nums or self.v_patch_nums)]    # from small to large
         assert patch_hws[-1][0] == H and patch_hws[-1][1] == W, f'{patch_hws[-1]=} != ({H=}, {W=})'
@@ -167,10 +167,10 @@ class VectorQuantizer2(nn.Module):
             
             idx_Bhw = idx_N.view(B, ph, pw)
             h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
-            h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
+            h_BChw = self.quant_resi[si/(SN-1)](h_BChw) # Refinement network
             f_hat.add_(h_BChw)
             f_rest.sub_(h_BChw)
-            f_hat_or_idx_Bl.append(f_hat.clone() if to_fhat else idx_N.reshape(B, ph*pw))
+            f_hat_or_idx_Bl.append(f_hat.clone() if to_fhat else idx_N.reshape(B, ph*pw)) # (B, ph*pw)
         
         return f_hat_or_idx_Bl
     

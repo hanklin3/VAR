@@ -16,18 +16,27 @@ dropout_add_layer_norm = fused_mlp_func = memory_efficient_attention = flash_att
 try:
     from flash_attn.ops.layer_norm import dropout_add_layer_norm
     from flash_attn.ops.fused_dense import fused_mlp_func
-except ImportError: pass
+    print('from flash_attn.ops.layer_norm import dropout_add_layer_norm imported')
+except ImportError: 
+    print('flash_attn.ops.layer_norm and flash_attn.ops.fused_dense not found'); pass
+    pass
 # automatically import faster attention implementations
-try: from xformers.ops import memory_efficient_attention
-except ImportError: pass
-try: from flash_attn import flash_attn_func              # qkv: BLHc, ret: BLHcq
-except ImportError: pass
+try: 
+    from xformers.ops import memory_efficient_attention
+    print('xformers imported for memory_efficient_attention')
+except ImportError: print('xformers not found'); pass
+try: 
+    from flash_attn import flash_attn_func              # qkv: BLHc, ret: BLHcq
+    print('from flash_attn import flash_attn_func imported')
+except ImportError: print('flash_attn not found'); pass
 try: from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
 except ImportError:
     def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
-        attn = query.mul(scale) @ key.transpose(-2, -1) # BHLc @ BHcL => BHLL
-        if attn_mask is not None: attn.add_(attn_mask)
-        return (F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True) if dropout_p > 0 else attn.softmax(dim=-1)) @ value
+        # If B=32, Heads=16, L=14=1**2+2**2+3**2 (for patch_num=(1,2,3)), c=1024 (embedding dim), head_dim = 1024/16 = 64
+        # Input x shape: [32, 14, 1024] --> q,k,v shape: [32, 16, 14, 64] (BHLc format) --> attention matrix shape: [32, 16, 14, 14] (BHLL format)
+        attn = query.mul(scale) @ key.transpose(-2, -1) # BHLc @ BHcL => BHLL ([B, num_heads, L, L]). 
+        if attn_mask is not None: attn.add_(attn_mask) # # attn_bias has 0s for allowed attention and -inf for masked positions, -inf values will become 0 after softmax
+        return (F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True) if dropout_p > 0 else attn.softmax(dim=-1)) @ value # attn = drop(softmax()), attn @ value
 
 
 class FFN(nn.Module):
@@ -110,9 +119,14 @@ class SelfAttention(nn.Module):
         
         dropout_p = self.attn_drop if self.training else 0.0
         if using_flash:
+            # Flash attention doesn't need explicit mask
             oup = flash_attn_func(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), dropout_p=dropout_p, softmax_scale=self.scale).view(B, L, C)
         elif self.using_xform:
-            oup = memory_efficient_attention(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), attn_bias=None if attn_bias is None else attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1), p=dropout_p, scale=self.scale).view(B, L, C)
+            oup = memory_efficient_attention(
+                q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), 
+                attn_bias=None if attn_bias is None else attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1), 
+                p=dropout_p, 
+                scale=self.scale).view(B, L, C)
         else:
             oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
         
@@ -150,11 +164,16 @@ class AdaLNSelfAttn(nn.Module):
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
     def forward(self, x, cond_BD, attn_bias):   # C: embed_dim, D: cond_dim
+        # 1. AdaLN (Adaptive Layer Norm) parameters
         if self.shared_aln:
+            # Each transformer block needs 6 parameters for its two sublayers:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
         else:
+            # Reshape 6*C parameters into 6 groups of size C
             gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
+        # 2. First sublayer: Self-attention with mask attn_bias 
         x = x + self.drop_path(self.attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), attn_bias=attn_bias ).mul_(gamma1))
+        # 3. Second sublayer: FFN
         x = x + self.drop_path(self.ffn( self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed when FusedMLP is used
         return x
     
